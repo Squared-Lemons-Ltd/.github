@@ -1,0 +1,99 @@
+name: Claude Code — Ready Issue
+
+on:
+  projects_v2_item:
+    types: [edited]
+
+# One run per project item at a time — never cancel a running job
+concurrency:
+  group: claude-code-${{ github.event.projects_v2_item.id }}
+  cancel-in-progress: false
+
+jobs:
+  run-claude:
+    name: Run Claude Code on issue
+    runs-on: self-hosted
+
+    # Only fire when the Status field moves to "Ready"
+    if: ${{ github.event.changes.field_value.to.name == 'Ready' }}
+
+    steps:
+      # ------------------------------------------------------------------
+      # 1. Resolve which issue and repo this project item points to
+      # ------------------------------------------------------------------
+      - name: Resolve issue and repo from project item
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.ORG_PROJECT_TOKEN }}
+        run: |
+          NODE_ID="${{ github.event.projects_v2_item.content_node_id }}"
+
+          RESULT=$(gh api graphql -f query="
+            query(\$nodeId: ID!) {
+              node(id: \$nodeId) {
+                ... on Issue {
+                  number
+                  repository {
+                    nameWithOwner
+                  }
+                }
+              }
+            }
+          " -f nodeId="$NODE_ID")
+
+          ISSUE_NUMBER=$(echo "$RESULT" | jq -r '.data.node.number')
+          REPO=$(echo "$RESULT"         | jq -r '.data.node.repository.nameWithOwner')
+
+          # Fail fast if we couldn't resolve — item might be a draft/note
+          if [ "$ISSUE_NUMBER" = "null" ] || [ -z "$ISSUE_NUMBER" ]; then
+            echo "Could not resolve issue from project item (may be a draft card). Skipping."
+            exit 0
+          fi
+
+          echo "issue_number=$ISSUE_NUMBER"                                >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO"                                                >> "$GITHUB_OUTPUT"
+          echo "item_id=${{ github.event.projects_v2_item.id }}"          >> "$GITHUB_OUTPUT"
+          echo "project_id=${{ github.event.projects_v2_item.project_node_id }}" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved: $REPO#$ISSUE_NUMBER (item ${{ github.event.projects_v2_item.id }})"
+
+      # ------------------------------------------------------------------
+      # 2. Copy Claude OAuth credentials to a per-job temp directory
+      #    Mounted read-write so token refresh works inside the container
+      # ------------------------------------------------------------------
+      - name: Prepare Claude credentials
+        id: creds
+        run: |
+          JOB_ID="${{ github.run_id }}-${{ github.run_attempt }}"
+          CREDS_DIR="/tmp/claude-job-$JOB_ID"
+          cp -r "$HOME/.claude" "$CREDS_DIR"
+          echo "creds_dir=$CREDS_DIR" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------------------------------------------
+      # 3. Run the Claude Code container
+      # ------------------------------------------------------------------
+      - name: Run Claude Code container
+        env:
+          GH_TOKEN: ${{ secrets.ORG_PROJECT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          docker run --rm \
+            --name "claude-job-${{ github.run_id }}-${{ github.run_attempt }}" \
+            -v "${{ steps.creds.outputs.creds_dir }}:/root/.claude" \
+            -e GITHUB_TOKEN="$GH_TOKEN" \
+            -e TELEGRAM_BOT_TOKEN \
+            -e TELEGRAM_CHAT_ID \
+            -e ISSUE_NUMBER="${{ steps.resolve.outputs.issue_number }}" \
+            -e REPO="${{ steps.resolve.outputs.repo }}" \
+            -e ITEM_ID="${{ steps.resolve.outputs.item_id }}" \
+            -e PROJECT_ID="${{ steps.resolve.outputs.project_id }}" \
+            -e MAX_ITERATIONS="${{ vars.CLAUDE_MAX_ITERATIONS || '5' }}" \
+            squared-lemons/claude-code-runner:latest
+
+      # ------------------------------------------------------------------
+      # 4. Always clean up the temp credentials, even on failure
+      # ------------------------------------------------------------------
+      - name: Clean up credentials
+        if: always()
+        run: rm -rf "${{ steps.creds.outputs.creds_dir }}"
