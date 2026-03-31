@@ -1,12 +1,12 @@
 name: Claude Code — Ready Issue
 
 on:
-  projects_v2_item:
-    types: [edited]
+  repository_dispatch:
+    types: [claude-code-ready]
 
 # One run per project item at a time — never cancel a running job
 concurrency:
-  group: claude-code-${{ github.event.projects_v2_item.id }}
+  group: claude-code-${{ github.event.client_payload.item_id }}
   cancel-in-progress: false
 
 jobs:
@@ -14,51 +14,9 @@ jobs:
     name: Run Claude Code on issue
     runs-on: self-hosted
 
-    # Only fire when the Status field moves to "Ready"
-    if: ${{ github.event.changes.field_value.to.name == 'Ready' }}
-
     steps:
       # ------------------------------------------------------------------
-      # 1. Resolve which issue and repo this project item points to
-      # ------------------------------------------------------------------
-      - name: Resolve issue and repo from project item
-        id: resolve
-        env:
-          GH_TOKEN: ${{ secrets.ORG_PROJECT_TOKEN }}
-        run: |
-          NODE_ID="${{ github.event.projects_v2_item.content_node_id }}"
-
-          RESULT=$(gh api graphql -f query="
-            query(\$nodeId: ID!) {
-              node(id: \$nodeId) {
-                ... on Issue {
-                  number
-                  repository {
-                    nameWithOwner
-                  }
-                }
-              }
-            }
-          " -f nodeId="$NODE_ID")
-
-          ISSUE_NUMBER=$(echo "$RESULT" | jq -r '.data.node.number')
-          REPO=$(echo "$RESULT"         | jq -r '.data.node.repository.nameWithOwner')
-
-          # Fail fast if we couldn't resolve — item might be a draft/note
-          if [ "$ISSUE_NUMBER" = "null" ] || [ -z "$ISSUE_NUMBER" ]; then
-            echo "Could not resolve issue from project item (may be a draft card). Skipping."
-            exit 0
-          fi
-
-          echo "issue_number=$ISSUE_NUMBER"                                >> "$GITHUB_OUTPUT"
-          echo "repo=$REPO"                                                >> "$GITHUB_OUTPUT"
-          echo "item_id=${{ github.event.projects_v2_item.id }}"          >> "$GITHUB_OUTPUT"
-          echo "project_id=${{ github.event.projects_v2_item.project_node_id }}" >> "$GITHUB_OUTPUT"
-
-          echo "Resolved: $REPO#$ISSUE_NUMBER (item ${{ github.event.projects_v2_item.id }})"
-
-      # ------------------------------------------------------------------
-      # 2. Copy Claude OAuth credentials to a per-job temp directory
+      # 1. Copy Claude OAuth credentials to a per-job temp directory
       #    Mounted read-write so token refresh works inside the container
       # ------------------------------------------------------------------
       - name: Prepare Claude credentials
@@ -70,7 +28,7 @@ jobs:
           echo "creds_dir=$CREDS_DIR" >> "$GITHUB_OUTPUT"
 
       # ------------------------------------------------------------------
-      # 3. Run the Claude Code container
+      # 2. Run the Claude Code container
       # ------------------------------------------------------------------
       - name: Run Claude Code container
         env:
@@ -84,15 +42,15 @@ jobs:
             -e GITHUB_TOKEN="$GH_TOKEN" \
             -e TELEGRAM_BOT_TOKEN \
             -e TELEGRAM_CHAT_ID \
-            -e ISSUE_NUMBER="${{ steps.resolve.outputs.issue_number }}" \
-            -e REPO="${{ steps.resolve.outputs.repo }}" \
-            -e ITEM_ID="${{ steps.resolve.outputs.item_id }}" \
-            -e PROJECT_ID="${{ steps.resolve.outputs.project_id }}" \
+            -e ISSUE_NUMBER="${{ github.event.client_payload.issue_number }}" \
+            -e REPO="${{ github.event.client_payload.repo }}" \
+            -e ITEM_ID="${{ github.event.client_payload.item_id }}" \
+            -e PROJECT_ID="${{ github.event.client_payload.project_id }}" \
             -e MAX_ITERATIONS="${{ vars.CLAUDE_MAX_ITERATIONS || '5' }}" \
             squared-lemons/claude-code-runner:latest
 
       # ------------------------------------------------------------------
-      # 4. Always clean up the temp credentials, even on failure
+      # 3. Always clean up the temp credentials, even on failure
       # ------------------------------------------------------------------
       - name: Clean up credentials
         if: always()
