@@ -11,50 +11,52 @@ concurrency:
 
 jobs:
   poll:
-    name: Poll project for Ready items
+    name: Poll all org projects for Ready items
     runs-on: self-hosted
 
     steps:
-      - name: Find Ready items and dispatch
+      - name: Find Ready items across all projects and dispatch
         env:
           GH_TOKEN: ${{ secrets.ORG_PROJECT_TOKEN }}
           ORG: ${{ vars.ORG_LOGIN }}
-          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
         run: |
           set -euo pipefail
 
           # ------------------------------------------------------------------
-          # 1. Fetch the project — items + the Status field definition
+          # 1. Fetch all org projects (up to 100) with their fields and items
           # ------------------------------------------------------------------
-          PROJECT=$(gh api graphql -f query='
-            query($org: String!, $num: Int!) {
+          PROJECTS=$(gh api graphql -f query='
+            query($org: String!) {
               organization(login: $org) {
-                projectV2(number: $num) {
-                  id
-                  fields(first: 30) {
-                    nodes {
-                      ... on ProjectV2SingleSelectField {
-                        id
-                        name
-                        options { id name }
-                      }
-                    }
-                  }
-                  items(first: 100) {
-                    nodes {
-                      id
-                      fieldValues(first: 20) {
-                        nodes {
-                          ... on ProjectV2ItemFieldSingleSelectValue {
-                            name
-                            field { ... on ProjectV2FieldCommon { name } }
-                          }
+                projectsV2(first: 100) {
+                  nodes {
+                    id
+                    title
+                    fields(first: 30) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options { id name }
                         }
                       }
-                      content {
-                        ... on Issue {
-                          number
-                          repository { nameWithOwner }
+                    }
+                    items(first: 100) {
+                      nodes {
+                        id
+                        fieldValues(first: 20) {
+                          nodes {
+                            ... on ProjectV2ItemFieldSingleSelectValue {
+                              name
+                              field { ... on ProjectV2FieldCommon { name } }
+                            }
+                          }
+                        }
+                        content {
+                          ... on Issue {
+                            number
+                            repository { nameWithOwner }
+                          }
                         }
                       }
                     }
@@ -62,90 +64,97 @@ jobs:
                 }
               }
             }
-          ' -f org="$ORG" -F num="$PROJECT_NUMBER")
+          ' -f org="$ORG")
 
-          PROJECT_ID=$(echo "$PROJECT" | jq -r '.data.organization.projectV2.id')
-
-          # ------------------------------------------------------------------
-          # 2. Resolve the Status field ID and the "Ready" / "In Progress" option IDs
-          # ------------------------------------------------------------------
-          STATUS_FIELD_ID=$(echo "$PROJECT" | jq -r '
-            .data.organization.projectV2.fields.nodes[]
-            | select(.name == "Status")
-            | .id
-          ')
-
-          IN_PROGRESS_OPTION_ID=$(echo "$PROJECT" | jq -r '
-            .data.organization.projectV2.fields.nodes[]
-            | select(.name == "Status")
-            | .options[]
-            | select(.name == "In Progress")
-            | .id
-          ')
-
-          if [ -z "$STATUS_FIELD_ID" ] || [ -z "$IN_PROGRESS_OPTION_ID" ]; then
-            echo "Could not resolve Status field or 'In Progress' option. Check project field names."
-            exit 1
-          fi
+          PROJECT_COUNT=$(echo "$PROJECTS" | jq '.data.organization.projectsV2.nodes | length')
+          echo "Found $PROJECT_COUNT project(s) in org $ORG"
 
           # ------------------------------------------------------------------
-          # 3. Iterate over items whose Status == "Ready"
+          # 2. Loop over every project
           # ------------------------------------------------------------------
-          READY_ITEMS=$(echo "$PROJECT" | jq -c '
-            .data.organization.projectV2.items.nodes[]
-            | select(
-                .fieldValues.nodes[]?
-                | select(.field.name == "Status" and .name == "Ready")
-              )
-          ')
+          echo "$PROJECTS" | jq -c '.data.organization.projectsV2.nodes[]' | while IFS= read -r PROJECT; do
+            PROJECT_ID=$(echo "$PROJECT"    | jq -r '.id')
+            PROJECT_TITLE=$(echo "$PROJECT" | jq -r '.title')
 
-          if [ -z "$READY_ITEMS" ]; then
-            echo "No Ready items found."
-            exit 0
-          fi
+            # Find the Status field for this project (skip if none)
+            STATUS_FIELD=$(echo "$PROJECT" | jq -r '
+              .fields.nodes[] | select(.name == "Status") | @base64
+            ' | head -1)
 
-          echo "$READY_ITEMS" | while IFS= read -r ITEM; do
-            ITEM_ID=$(echo "$ITEM"      | jq -r '.id')
-            ISSUE_NUMBER=$(echo "$ITEM" | jq -r '.content.number')
-            REPO=$(echo "$ITEM"         | jq -r '.content.repository.nameWithOwner')
-
-            # Skip draft cards (no linked issue)
-            if [ "$ISSUE_NUMBER" = "null" ] || [ -z "$ISSUE_NUMBER" ]; then
-              echo "Item $ITEM_ID has no linked issue — skipping."
+            if [ -z "$STATUS_FIELD" ]; then
+              echo "[$PROJECT_TITLE] No Status field — skipping."
               continue
             fi
 
-            echo "Dispatching claude-code-ready for $REPO#$ISSUE_NUMBER (item $ITEM_ID)"
+            STATUS_FIELD_JSON=$(echo "$STATUS_FIELD" | base64 -d)
+            STATUS_FIELD_ID=$(echo "$STATUS_FIELD_JSON"  | jq -r '.id')
+            IN_PROGRESS_OPTION_ID=$(echo "$STATUS_FIELD_JSON" | jq -r '
+              .options[] | select(.name == "In Progress") | .id
+            ')
+
+            if [ -z "$IN_PROGRESS_OPTION_ID" ]; then
+              echo "[$PROJECT_TITLE] No 'In Progress' option on Status field — skipping."
+              continue
+            fi
 
             # ----------------------------------------------------------------
-            # 4. Move item to "In Progress" BEFORE dispatching, so a second
-            #    poll tick won't re-queue the same item if the run is slow
+            # 3. Find items with Status == "Ready"
             # ----------------------------------------------------------------
-            gh api graphql -f query='
-              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-                updateProjectV2ItemFieldValue(input: {
-                  projectId:   $projectId
-                  itemId:      $itemId
-                  fieldId:     $fieldId
-                  value: { singleSelectOptionId: $optionId }
-                }) { projectV2Item { id } }
-              }
-            ' \
-              -f projectId="$PROJECT_ID" \
-              -f itemId="$ITEM_ID" \
-              -f fieldId="$STATUS_FIELD_ID" \
-              -f optionId="$IN_PROGRESS_OPTION_ID"
+            READY_ITEMS=$(echo "$PROJECT" | jq -c '
+              .items.nodes[]
+              | select(
+                  .fieldValues.nodes[]?
+                  | select(.field.name == "Status" and .name == "Ready")
+                )
+            ')
 
-            # ----------------------------------------------------------------
-            # 5. Dispatch to the target repo's workflow
-            # ----------------------------------------------------------------
-            gh api "repos/$REPO/dispatches" \
-              --method POST \
-              --field event_type=claude-code-ready \
-              --field "client_payload[issue_number]=$ISSUE_NUMBER" \
-              --field "client_payload[repo]=$REPO" \
-              --field "client_payload[item_id]=$ITEM_ID" \
-              --field "client_payload[project_id]=$PROJECT_ID"
+            if [ -z "$READY_ITEMS" ]; then
+              echo "[$PROJECT_TITLE] No Ready items."
+              continue
+            fi
 
-            echo "Dispatched and moved to In Progress: $REPO#$ISSUE_NUMBER"
+            echo "$READY_ITEMS" | while IFS= read -r ITEM; do
+              ITEM_ID=$(echo "$ITEM"      | jq -r '.id')
+              ISSUE_NUMBER=$(echo "$ITEM" | jq -r '.content.number')
+              REPO=$(echo "$ITEM"         | jq -r '.content.repository.nameWithOwner')
+
+              # Skip draft cards (no linked issue)
+              if [ "$ISSUE_NUMBER" = "null" ] || [ -z "$ISSUE_NUMBER" ]; then
+                echo "[$PROJECT_TITLE] Item $ITEM_ID has no linked issue — skipping."
+                continue
+              fi
+
+              echo "[$PROJECT_TITLE] Dispatching claude-code-ready for $REPO#$ISSUE_NUMBER"
+
+              # --------------------------------------------------------------
+              # 4. Move to "In Progress" BEFORE dispatching — idempotency guard
+              # --------------------------------------------------------------
+              gh api graphql -f query='
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId:   $projectId
+                    itemId:      $itemId
+                    fieldId:     $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }) { projectV2Item { id } }
+                }
+              ' \
+                -f projectId="$PROJECT_ID" \
+                -f itemId="$ITEM_ID" \
+                -f fieldId="$STATUS_FIELD_ID" \
+                -f optionId="$IN_PROGRESS_OPTION_ID"
+
+              # --------------------------------------------------------------
+              # 5. Dispatch to the target repo
+              # --------------------------------------------------------------
+              gh api "repos/$REPO/dispatches" \
+                --method POST \
+                --field event_type=claude-code-ready \
+                --field "client_payload[issue_number]=$ISSUE_NUMBER" \
+                --field "client_payload[repo]=$REPO" \
+                --field "client_payload[item_id]=$ITEM_ID" \
+                --field "client_payload[project_id]=$PROJECT_ID"
+
+              echo "[$PROJECT_TITLE] Dispatched and moved to In Progress: $REPO#$ISSUE_NUMBER"
+            done
           done
