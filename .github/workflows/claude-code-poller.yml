@@ -1,0 +1,151 @@
+name: Claude Code — Project Poller
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:          # allow manual trigger for testing
+
+concurrency:
+  group: claude-code-poller
+  cancel-in-progress: true    # if a poll is still running, skip the next tick
+
+jobs:
+  poll:
+    name: Poll project for Ready items
+    runs-on: self-hosted
+
+    steps:
+      - name: Find Ready items and dispatch
+        env:
+          GH_TOKEN: ${{ secrets.ORG_PROJECT_TOKEN }}
+          ORG: ${{ vars.ORG_LOGIN }}
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+        run: |
+          set -euo pipefail
+
+          # ------------------------------------------------------------------
+          # 1. Fetch the project — items + the Status field definition
+          # ------------------------------------------------------------------
+          PROJECT=$(gh api graphql -f query='
+            query($org: String!, $num: Int!) {
+              organization(login: $org) {
+                projectV2(number: $num) {
+                  id
+                  fields(first: 30) {
+                    nodes {
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        name
+                        options { id name }
+                      }
+                    }
+                  }
+                  items(first: 100) {
+                    nodes {
+                      id
+                      fieldValues(first: 20) {
+                        nodes {
+                          ... on ProjectV2ItemFieldSingleSelectValue {
+                            name
+                            field { ... on ProjectV2FieldCommon { name } }
+                          }
+                        }
+                      }
+                      content {
+                        ... on Issue {
+                          number
+                          repository { nameWithOwner }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ' -f org="$ORG" -F num="$PROJECT_NUMBER")
+
+          PROJECT_ID=$(echo "$PROJECT" | jq -r '.data.organization.projectV2.id')
+
+          # ------------------------------------------------------------------
+          # 2. Resolve the Status field ID and the "Ready" / "In Progress" option IDs
+          # ------------------------------------------------------------------
+          STATUS_FIELD_ID=$(echo "$PROJECT" | jq -r '
+            .data.organization.projectV2.fields.nodes[]
+            | select(.name == "Status")
+            | .id
+          ')
+
+          IN_PROGRESS_OPTION_ID=$(echo "$PROJECT" | jq -r '
+            .data.organization.projectV2.fields.nodes[]
+            | select(.name == "Status")
+            | .options[]
+            | select(.name == "In Progress")
+            | .id
+          ')
+
+          if [ -z "$STATUS_FIELD_ID" ] || [ -z "$IN_PROGRESS_OPTION_ID" ]; then
+            echo "Could not resolve Status field or 'In Progress' option. Check project field names."
+            exit 1
+          fi
+
+          # ------------------------------------------------------------------
+          # 3. Iterate over items whose Status == "Ready"
+          # ------------------------------------------------------------------
+          READY_ITEMS=$(echo "$PROJECT" | jq -c '
+            .data.organization.projectV2.items.nodes[]
+            | select(
+                .fieldValues.nodes[]?
+                | select(.field.name == "Status" and .name == "Ready")
+              )
+          ')
+
+          if [ -z "$READY_ITEMS" ]; then
+            echo "No Ready items found."
+            exit 0
+          fi
+
+          echo "$READY_ITEMS" | while IFS= read -r ITEM; do
+            ITEM_ID=$(echo "$ITEM"      | jq -r '.id')
+            ISSUE_NUMBER=$(echo "$ITEM" | jq -r '.content.number')
+            REPO=$(echo "$ITEM"         | jq -r '.content.repository.nameWithOwner')
+
+            # Skip draft cards (no linked issue)
+            if [ "$ISSUE_NUMBER" = "null" ] || [ -z "$ISSUE_NUMBER" ]; then
+              echo "Item $ITEM_ID has no linked issue — skipping."
+              continue
+            fi
+
+            echo "Dispatching claude-code-ready for $REPO#$ISSUE_NUMBER (item $ITEM_ID)"
+
+            # ----------------------------------------------------------------
+            # 4. Move item to "In Progress" BEFORE dispatching, so a second
+            #    poll tick won't re-queue the same item if the run is slow
+            # ----------------------------------------------------------------
+            gh api graphql -f query='
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId:   $projectId
+                  itemId:      $itemId
+                  fieldId:     $fieldId
+                  value: { singleSelectOptionId: $optionId }
+                }) { projectV2Item { id } }
+              }
+            ' \
+              -f projectId="$PROJECT_ID" \
+              -f itemId="$ITEM_ID" \
+              -f fieldId="$STATUS_FIELD_ID" \
+              -f optionId="$IN_PROGRESS_OPTION_ID"
+
+            # ----------------------------------------------------------------
+            # 5. Dispatch to the target repo's workflow
+            # ----------------------------------------------------------------
+            gh api "repos/$REPO/dispatches" \
+              --method POST \
+              --field event_type=claude-code-ready \
+              --field "client_payload[issue_number]=$ISSUE_NUMBER" \
+              --field "client_payload[repo]=$REPO" \
+              --field "client_payload[item_id]=$ITEM_ID" \
+              --field "client_payload[project_id]=$PROJECT_ID"
+
+            echo "Dispatched and moved to In Progress: $REPO#$ISSUE_NUMBER"
+          done
