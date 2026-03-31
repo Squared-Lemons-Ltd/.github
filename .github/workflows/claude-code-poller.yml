@@ -25,7 +25,7 @@ jobs:
           # ------------------------------------------------------------------
           # 1. Fetch all org projects (up to 100) with their fields and items
           # ------------------------------------------------------------------
-          PROJECTS=$(gh api graphql -f query='
+          FETCH_QUERY=$(cat <<'GQL'
             query($org: String!) {
               organization(login: $org) {
                 projectsV2(first: 100) {
@@ -64,7 +64,10 @@ jobs:
                 }
               }
             }
-          ' -f org="$ORG")
+          GQL
+          )
+
+          PROJECTS=$(gh api graphql -f query="$FETCH_QUERY" -f org="$ORG")
 
           PROJECT_COUNT=$(echo "$PROJECTS" | jq '.data.organization.projectsV2.nodes | length')
           echo "Found $PROJECT_COUNT project(s) in org $ORG"
@@ -72,6 +75,18 @@ jobs:
           # ------------------------------------------------------------------
           # 2. Loop over every project
           # ------------------------------------------------------------------
+          MUTATION_QUERY=$(cat <<'GQL'
+            mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId:   $projectId
+                itemId:      $itemId
+                fieldId:     $fieldId
+                value: { singleSelectOptionId: $optionId }
+              }) { projectV2Item { id } }
+            }
+          GQL
+          )
+
           echo "$PROJECTS" | jq -c '.data.organization.projectsV2.nodes[]' | while IFS= read -r PROJECT; do
             PROJECT_ID=$(echo "$PROJECT"    | jq -r '.id')
             PROJECT_TITLE=$(echo "$PROJECT" | jq -r '.title')
@@ -129,16 +144,8 @@ jobs:
               # --------------------------------------------------------------
               # 4. Move to "In Progress" BEFORE dispatching — idempotency guard
               # --------------------------------------------------------------
-              gh api graphql -f query='
-                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-                  updateProjectV2ItemFieldValue(input: {
-                    projectId:   $projectId
-                    itemId:      $itemId
-                    fieldId:     $fieldId
-                    value: { singleSelectOptionId: $optionId }
-                  }) { projectV2Item { id } }
-                }
-              ' \
+              gh api graphql \
+                -f query="$MUTATION_QUERY" \
                 -f projectId="$PROJECT_ID" \
                 -f itemId="$ITEM_ID" \
                 -f fieldId="$STATUS_FIELD_ID" \
